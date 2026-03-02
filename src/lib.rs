@@ -1,6 +1,7 @@
 use argon2::{Algorithm, Argon2, Params, Version};
 use chrono::{DateTime, Duration, Utc};
-use log::{debug, info};
+use log::info;
+use serde::{Deserialize, Serialize};
 use std::time::{Duration as StdDuration, Instant};
 
 pub const DEFAULT_HASH_LEN: usize = 32;
@@ -8,68 +9,93 @@ pub const DEFAULT_PEPPER_LEN: usize = 16;
 pub const DEFAULT_SALT_LEN: usize = 16;
 pub const DEFAULT_SESSION_LEN: usize = 32;
 
-#[derive(Clone)]
+/// Serde helpers: hex array
+#[derive(Clone, Serialize, Deserialize)]
 pub struct HashConfig<const PEPPER_LEN: usize = DEFAULT_PEPPER_LEN> {
+    #[serde(with = "serde_hex_array")]
     pub pepper: [u8; PEPPER_LEN],
     pub memory_kib: u32,
     pub time_cost: u32,
     pub lanes: u32,
 }
 
-impl<const PEPPER_LEN: usize> serde::Serialize for HashConfig<PEPPER_LEN> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("HashConfig", 4)?;
-        let mut hex_pepper = String::with_capacity(PEPPER_LEN * 2);
-        for b in &self.pepper {
-            use std::fmt::Write;
-            write!(&mut hex_pepper, "{:02x}", b).unwrap();
-        }
-        state.serialize_field("pepper", &hex_pepper)?;
-        state.serialize_field("memory_kib", &self.memory_kib)?;
-        state.serialize_field("time_cost", &self.time_cost)?;
-        state.serialize_field("lanes", &self.lanes)?;
-        state.end()
-    }
-}
+pub mod serde_hex_array {
+    use serde::{Deserialize, Deserializer, Serializer};
 
-impl<'de, const PEPPER_LEN: usize> serde::Deserialize<'de> for HashConfig<PEPPER_LEN> {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(serde::Deserialize)]
-        struct HashConfigHelper {
-            pepper: String,
-            memory_kib: u32,
-            time_cost: u32,
-            lanes: u32,
+    #[inline]
+    pub fn bytes_to_hex<const N: usize>(bytes: &[u8; N]) -> String {
+        let mut out = String::with_capacity(N * 2);
+        for b in bytes {
+            use core::fmt::Write;
+            let _ = write!(&mut out, "{:02x}", b);
         }
-        let helper = HashConfigHelper::deserialize(deserializer)?;
-        let s = helper.pepper.as_str();
-        if s.len() != PEPPER_LEN * 2 {
-            return Err(serde::de::Error::invalid_length(
-                s.len() / 2,
-                &format!("expected {} bytes for pepper", PEPPER_LEN).as_str(),
-            ));
+        out
+    }
+
+    #[inline]
+    pub fn hex_to_bytes<const N: usize>(s: &str) -> Result<[u8; N], String> {
+        if s.len() != N * 2 {
+            return Err(format!("expected {} bytes hex, got {}", N, s.len() / 2));
         }
-        let mut pepper = [0u8; PEPPER_LEN];
-        for (i, byte) in pepper.iter_mut().enumerate() {
+        let mut out = [0u8; N];
+        for i in 0..N {
             let idx = i * 2;
-            *byte = u8::from_str_radix(&s[idx..idx + 2], 16).map_err(serde::de::Error::custom)?;
+            out[i] = u8::from_str_radix(&s[idx..idx + 2], 16)
+                .map_err(|e| format!("invalid hex: {}", e))?;
         }
-        Ok(HashConfig {
-            pepper,
-            memory_kib: helper.memory_kib,
-            time_cost: helper.time_cost,
-            lanes: helper.lanes,
-        })
+        Ok(out)
+    }
+
+    pub fn serialize<S, const N: usize>(bytes: &[u8; N], s: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let out = bytes_to_hex(bytes);
+        s.serialize_str(&out)
+    }
+
+    pub fn deserialize<'de, D, const N: usize>(d: D) -> Result<[u8; N], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(d)?;
+        hex_to_bytes::<N>(&s).map_err(serde::de::Error::custom)
     }
 }
 
+pub mod serde_hex_array_vec {
+    use super::serde_hex_array::{bytes_to_hex, hex_to_bytes};
+    use serde::ser::SerializeSeq;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    // Vec<[u8; N]> <-> Vec<String(hex)>
+    pub fn serialize<S, const N: usize>(items: &Vec<[u8; N]>, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut seq = s.serialize_seq(Some(items.len()))?;
+        for it in items {
+            let hex = bytes_to_hex(it);
+            seq.serialize_element(&hex)?;
+        }
+        seq.end()
+    }
+
+    pub fn deserialize<'de, D, const N: usize>(d: D) -> Result<Vec<[u8; N]>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let hex_strings: Vec<String> = Deserialize::deserialize(d)?;
+        let mut out = Vec::with_capacity(hex_strings.len());
+        for hex_string in hex_strings {
+            let bytes = hex_to_bytes::<N>(&hex_string).map_err(serde::de::Error::custom)?;
+            out.push(bytes);
+        }
+        Ok(out)
+    }
+}
+
+/// Hash benchmarking and config generation
 impl<const PEPPER_LEN: usize> HashConfig<PEPPER_LEN> {
     pub fn benchmark(target_ms: u64) -> Self {
         info!("Benchmarking HashConfig parameters...");
@@ -98,9 +124,7 @@ impl<const PEPPER_LEN: usize> HashConfig<PEPPER_LEN> {
                 hasher
                     .hash_password_into(test_password.as_bytes(), &adv, &mut out)
                     .expect("hash during memory benchmark");
-                let duration = start.elapsed();
-                debug!("Memory {} KiB: duration={:?}", memory, duration);
-                duration
+                start.elapsed()
             },
             32768,
             1048576,
@@ -120,9 +144,7 @@ impl<const PEPPER_LEN: usize> HashConfig<PEPPER_LEN> {
                 hasher
                     .hash_password_into(test_password.as_bytes(), &adv, &mut out)
                     .expect("hash during time benchmark");
-                let duration = start.elapsed();
-                debug!("Time {}: duration={:?}", time, duration);
-                duration
+                start.elapsed()
             },
             1,
             10,
@@ -142,9 +164,7 @@ impl<const PEPPER_LEN: usize> HashConfig<PEPPER_LEN> {
                 hasher
                     .hash_password_into(test_password.as_bytes(), &adv, &mut out)
                     .expect("hash during lanes benchmark");
-                let duration = start.elapsed();
-                debug!("Lanes {}: duration={:?}", lanes, duration);
-                duration
+                start.elapsed()
             },
             1,
             8,
@@ -220,9 +240,7 @@ impl<const PEPPER_LEN: usize> HashConfig<PEPPER_LEN> {
     }
 }
 
-/// DBへの直接アクセスはやめてください
-/// キャッシュなどの階層構造を実装し、できる限りレイテンシを減らす実装をしてください
-/// DashMapとかがおすすめ
+/// KV trait
 pub trait KVTrait<K, V>
 where
     K: ?Sized,
@@ -233,23 +251,65 @@ where
     fn delete(&self, key: &K) -> bool;
 }
 
-/// セッションのデータ構造
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SessionValue<const SESSION_LEN: usize> {
+    #[serde(with = "serde_hex_array")]
     pub session_key: [u8; SESSION_LEN],
-    pub linked_accounts: Vec<Box<str>>,
+    pub linked_accounts_cache: Vec<Box<str>>,
     pub last_time: DateTime<Utc>,
     pub created_time: DateTime<Utc>,
+    pub primary_account: Option<Box<str>>,
 }
 
-/// アカウントのデータ構造
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AccountValue<const SALT_LEN: usize, const HASH_LEN: usize, const SESSION_LEN: usize> {
+    #[serde(with = "serde_hex_array")]
     pub password_hash: [u8; HASH_LEN],
+    #[serde(with = "serde_hex_array")]
     pub salt: [u8; SALT_LEN],
     pub last_time: DateTime<Utc>,
-    pub linked_sessions: Vec<[u8; SESSION_LEN]>,
+    #[serde(with = "serde_hex_array_vec")]
+    pub authed_linked_sessions: Vec<[u8; SESSION_LEN]>,
 }
 
-/// 認証マネージャー
+/// Fast Lock
+mod account_lock {
+    use ahash::AHasher;
+    use parking_lot::{Mutex, MutexGuard};
+    use std::hash::{Hash, Hasher};
+
+    // SHARDS must be power of two for bitmask
+    pub struct AccountLocks<const SHARDS: usize> {
+        locks: [Mutex<()>; SHARDS],
+    }
+
+    impl<const SHARDS: usize> AccountLocks<SHARDS> {
+        pub fn new() -> Self {
+            debug_assert!(SHARDS.is_power_of_two());
+            Self {
+                locks: std::array::from_fn(|_| Mutex::new(())),
+            }
+        }
+
+        #[inline]
+        fn shard_for_username(username: &str) -> usize {
+            let mut h = AHasher::default();
+            username.hash(&mut h);
+            (h.finish() as usize) & (SHARDS - 1)
+        }
+
+        #[inline]
+        pub fn lock_account<'a>(&'a self, username: &str) -> MutexGuard<'a, ()> {
+            let idx = Self::shard_for_username(username);
+            self.locks[idx].lock()
+        }
+    }
+}
+
+
+/// Main AuthManager
+/// - sessions はキャッシュ扱い。必要なら verify して primary_account を落とす。
+/// - account 側が正。session はキャッシュ更新
 pub struct AuthManager<
     S,
     A,
@@ -257,16 +317,21 @@ pub struct AuthManager<
     const HASH_LEN: usize = DEFAULT_HASH_LEN,
     const PEPPER_LEN: usize = DEFAULT_PEPPER_LEN,
     const SALT_LEN: usize = DEFAULT_SALT_LEN,
+    const ACCOUNT_LOCK_SHARDS: usize = 4096,
 > where
     S: KVTrait<[u8; SESSION_LEN], SessionValue<SESSION_LEN>> + Send + Sync,
     A: KVTrait<str, AccountValue<SALT_LEN, HASH_LEN, SESSION_LEN>> + Send + Sync,
 {
+    // NOTE: これらを pub にすると、AuthManager を介さない更新で整合が壊れる可能性が上がる
     pub sessions: S,
     pub accounts: A,
+
     pub session_timeout: Duration,
     pub account_timeout: Duration,
     pub password_hasher: Argon2<'static>,
     pub pepper: [u8; PEPPER_LEN],
+
+    account_locks: account_lock::AccountLocks<ACCOUNT_LOCK_SHARDS>,
 }
 
 impl<
@@ -276,7 +341,8 @@ impl<
     const HASH_LEN: usize,
     const PEPPER_LEN: usize,
     const SALT_LEN: usize,
-> AuthManager<S, A, SESSION_LEN, HASH_LEN, PEPPER_LEN, SALT_LEN>
+    const ACCOUNT_LOCK_SHARDS: usize,
+> AuthManager<S, A, SESSION_LEN, HASH_LEN, PEPPER_LEN, SALT_LEN, ACCOUNT_LOCK_SHARDS>
 where
     S: KVTrait<[u8; SESSION_LEN], SessionValue<SESSION_LEN>> + Send + Sync,
     A: KVTrait<str, AccountValue<SALT_LEN, HASH_LEN, SESSION_LEN>> + Send + Sync,
@@ -294,9 +360,9 @@ where
             session_timeout,
             account_timeout,
             password_hasher: Argon2::new(
-                argon2::Algorithm::Argon2id,
-                argon2::Version::V0x13,
-                argon2::Params::new(
+                Algorithm::Argon2id,
+                Version::V0x13,
+                Params::new(
                     hash_config.memory_kib,
                     hash_config.time_cost,
                     hash_config.lanes,
@@ -305,67 +371,116 @@ where
                 .expect("argon2 hash params"),
             ),
             pepper: hash_config.pepper,
+            account_locks: account_lock::AccountLocks::new(),
         }
     }
 
-    /// 新しいセッションを追加
+    /// session_id はランダム生成。衝突したらリトライ。
     pub fn create_session(&self) -> [u8; SESSION_LEN] {
         let session_id = Self::generate_session();
         if self.sessions.contains(&session_id) {
-            return self.create_session(); // Regenerate if collision occurs
+            return self.create_session();
         }
         let session_value = SessionValue::<SESSION_LEN> {
             session_key: session_id,
-            linked_accounts: Vec::new(),
+            linked_accounts_cache: Vec::new(),
             last_time: Utc::now(),
             created_time: Utc::now(),
+            primary_account: None,
         };
         self.sessions.set(&session_id, session_value);
         session_id
     }
 
-    /// セッションを削除
     pub fn delete_session(&self, session_id: &[u8; SESSION_LEN]) -> bool {
-        if let Some(session) = self.sessions.get(session_id) {
-            for account in session.linked_accounts {
-                if let Some(mut account_value) = self.accounts.get(&account) {
-                    account_value.linked_sessions.retain(|s| s != session_id);
-                    self.accounts.set(&account, account_value);
+        self.sessions.delete(session_id)
+    }
+
+    /// ガード入り
+    /// Noneならcreate sessionするなりするとよい
+    pub fn get_and_verify_session(
+        &self,
+        session_id: &[u8; SESSION_LEN],
+    ) -> Option<SessionValue<SESSION_LEN>> {
+        if let Some(mut session) = self.update_or_gc_session(session_id) {
+            if let Some(primary) = session.primary_account.clone() {
+                // auth_verify の正は account 側
+                if !self.auth_verify(session_id, &primary) {
+                    session.primary_account = None;
+                    // sessionはキャッシュ。ここで set するのはベストエフォート
+                    self.sessions.set(session_id, session.clone());
                 }
             }
-            self.sessions.delete(session_id)
+            return Some(session);
+        }
+        None
+    }
+
+    pub fn update_or_gc_session(
+        &self,
+        session_id: &[u8; SESSION_LEN],
+    ) -> Option<SessionValue<SESSION_LEN>> {
+        if let Some(mut session) = self.gc_sessions(session_id) {
+            session.last_time = Utc::now();
+            self.sessions.set(session_id, session.clone());
+            return Some(session);
+        }
+        None
+    }
+
+    pub fn gc_sessions(&self, session_id: &[u8; SESSION_LEN]) -> Option<SessionValue<SESSION_LEN>> {
+        if let Some(session) = self.sessions.get(session_id) {
+            let now = Utc::now();
+            if now - session.last_time > self.session_timeout {
+                let _ = self.delete_session(session_id);
+                return None;
+            }
+            Some(session)
         } else {
-            false
+            None
         }
     }
 
-    /// セッションを取得
-    pub fn get_session(&self, session_id: &[u8; SESSION_LEN]) -> Option<SessionValue<SESSION_LEN>> {
-        self.sessions.get(session_id)
+    pub fn set_primary_account(&self, session_id: &[u8; SESSION_LEN], username: &str) -> bool {
+        // primary_account はヒントなので verify 必須
+        if self.auth_verify(session_id, username) {
+            if let Some(mut session) = self.sessions.get(session_id) {
+                session.primary_account = Some(username.into());
+                self.sessions.set(session_id, session);
+                return true;
+            }
+        }
+        false
     }
 
-    /// 新しいアカウントを追加
     pub fn add_account(&self, username: &str, password: &str) {
+        let _g = self.account_locks.lock_account(username);
+
         let salt = Self::generate_random_salt();
         let password_hash = self.hash_password(password, &salt);
         let account_value = AccountValue::<SALT_LEN, HASH_LEN, SESSION_LEN> {
             password_hash,
             salt,
             last_time: Utc::now(),
-            linked_sessions: Vec::new(),
+            authed_linked_sessions: Vec::new(),
         };
         self.accounts.set(username, account_value);
     }
 
-    /// アカウントを削除
     pub fn delete_account(&self, username: &str) -> bool {
+        let _g = self.account_locks.lock_account(username);
+
+        // session側はキャッシュ扱いなので、この掃除はベストエフォート
         if let Some(account) = self.accounts.get(username) {
-            for session_id in account.linked_sessions {
-                if let Some(mut session_value) = self.sessions.get(&session_id) {
+            for session_id in &account.authed_linked_sessions {
+                if let Some(mut session_value) = self.sessions.get(session_id) {
                     session_value
-                        .linked_accounts
+                        .linked_accounts_cache
                         .retain(|a| a.as_ref() != username);
-                    self.sessions.set(&session_id, session_value);
+                    if session_value.primary_account.as_deref() == Some(username) {
+                        session_value.primary_account = None;
+                    }
+                    self.sessions.set(session_id, session_value);
                 }
             }
             self.accounts.delete(username)
@@ -374,7 +489,6 @@ where
         }
     }
 
-    /// アカウントを取得
     pub fn get_account(
         &self,
         username: &str,
@@ -382,87 +496,78 @@ where
         self.accounts.get(username)
     }
 
-    /// セッションを検査して、期限切れなら削除
-    pub fn check_and_gc_session(
-        &self,
-        session_id: &[u8; SESSION_LEN],
-    ) -> Option<SessionValue<SESSION_LEN>> {
-        if let Some(session) = self.sessions.get(session_id) {
-            let now = Utc::now();
-            if now - session.last_time > self.session_timeout {
-                self.delete_session(session_id);
-                return Some(session);
-            }
-        }
-        None
-    }
-
-    /// ログイン処理
     pub fn auth_login(
         &self,
         session_id: &[u8; SESSION_LEN],
         username: &str,
         password: &str,
     ) -> bool {
-        if let Some(account) = self.accounts.get(username) {
+        let _g = self.account_locks.lock_account(username);
+
+        if let Some(mut account) = self.accounts.get(username) {
             let expected_hash = self.hash_password(password, &account.salt);
-            if expected_hash == account.password_hash
-                && let Some(session) = self.sessions.get(session_id)
-            {
-                return self.link_account_to_session(username, session_id, account, session);
+            if expected_hash != account.password_hash {
+                return false;
             }
+
+            // account側が正。ここだけ確実に更新する
+            if !account.authed_linked_sessions.contains(session_id) {
+                account.authed_linked_sessions.push(*session_id);
+                account.last_time = Utc::now();
+                self.accounts.set(username, account);
+            }
+
+            // session側はキャッシュ更新（ベストエフォート）
+            if let Some(mut session) = self.sessions.get(session_id) {
+                if !session
+                    .linked_accounts_cache
+                    .iter()
+                    .any(|a| a.as_ref() == username)
+                {
+                    session.linked_accounts_cache.push(username.into());
+                }
+                self.sessions.set(session_id, session);
+            }
+
+            return true;
         }
         false
     }
 
-    /// ログアウト処理
-    pub fn auth_logout(&self, session_id: &[u8; SESSION_LEN], username: &str) -> bool {
+    /// 認可
+    pub fn auth_verify(&self, session_id: &[u8; SESSION_LEN], username: &str) -> bool {
         if let Some(account) = self.accounts.get(username) {
-            if let Some(session) = self.sessions.get(session_id) {
-                return self.unlink_account_from_session(username, session_id, account, session);
+            account.authed_linked_sessions.contains(session_id)
+        } else {
+            false
+        }
+    }
+
+    /// logout は account 側だけ更新
+    pub fn auth_logout(&self, session_id: &[u8; SESSION_LEN], username: &str) -> bool {
+        let _g = self.account_locks.lock_account(username);
+
+        if let Some(mut account) = self.accounts.get(username) {
+            let before = account.authed_linked_sessions.len();
+            account.authed_linked_sessions.retain(|s| s != session_id);
+            let changed = account.authed_linked_sessions.len() != before;
+            if changed {
+                account.last_time = Utc::now();
+                self.accounts.set(username, account);
             }
+            return changed;
         }
         false
-    }
-
-    /// セッションとアカウントをリンク
-    pub fn link_account_to_session(
-        &self,
-        username: &str,
-        session_id: &[u8; SESSION_LEN],
-        mut account: AccountValue<SALT_LEN, HASH_LEN, SESSION_LEN>,
-        mut session: SessionValue<SESSION_LEN>,
-    ) -> bool {
-        account.linked_sessions.push(*session_id);
-        session.linked_accounts.push(username.into());
-        self.accounts.set(username, account);
-        self.sessions.set(session_id, session);
-        true
-    }
-
-    /// セッションとアカウントのリンクを解除
-    pub fn unlink_account_from_session(
-        &self,
-        username: &str,
-        session_id: &[u8; SESSION_LEN],
-        mut account: AccountValue<SALT_LEN, HASH_LEN, SESSION_LEN>,
-        mut session: SessionValue<SESSION_LEN>,
-    ) -> bool {
-        account.linked_sessions.retain(|s| s != session_id);
-        session.linked_accounts.retain(|a| a.as_ref() != username);
-        self.accounts.set(username, account);
-        self.sessions.set(session_id, session);
-        true
     }
 
     fn hash_password(&self, password: &str, salt: &[u8; SALT_LEN]) -> [u8; HASH_LEN] {
         let mut out = [0u8; HASH_LEN];
-        let mut adv = Vec::new();
+        let mut adv = Vec::with_capacity(SALT_LEN + PEPPER_LEN);
         adv.extend_from_slice(salt);
         adv.extend_from_slice(&self.pepper);
         self.password_hasher
             .hash_password_into(password.as_bytes(), &adv, &mut out)
-            .unwrap();
+            .expect("argon2 hash_password_into");
         out
     }
 

@@ -1,14 +1,16 @@
 [package]
 name = "srv-session"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Server-side session management core with Argon2 and KV abstraction"
 license = "MIT"
 repository = "https://github.com/371tti/srv-session"
 
 [dependencies]
-argon2 = "0.5.3"
-chrono = "0.4.44"
-getrandom = "0.4.1"
-log = "0.4.29"
+ahash = "0.8.12"
+argon2 = "0.5"
+chrono = { version = "0.4", features = ["serde"] }
+getrandom = "0.4"
+log = "0.4"
+parking_lot = "0.12.5"
 serde = { version = "1.0", features = ["derive"] }

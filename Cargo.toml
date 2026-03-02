@@ -2,6 +2,9 @@
 name = "srv-session"
 version = "0.1.0"
 edition = "2024"
+description = "Server-side session management core with Argon2 and KV abstraction"
+license = "MIT"
+repository = "https://github.com/371tti/srv-session"
 
 [dependencies]
 argon2 = "0.5.3"

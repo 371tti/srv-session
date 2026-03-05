@@ -1,5 +1,5 @@
 use argon2::{Algorithm, Argon2, Params, Version};
-use chrono::{DateTime, Duration, Utc};
+use std::time::{Duration, SystemTime};
 use log::info;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration as StdDuration, Instant};
@@ -256,8 +256,8 @@ pub struct SessionValue<const SESSION_LEN: usize> {
     #[serde(with = "serde_hex_array")]
     pub session_key: [u8; SESSION_LEN],
     pub linked_accounts_cache: Vec<Box<str>>,
-    pub last_time: DateTime<Utc>,
-    pub created_time: DateTime<Utc>,
+    pub last_time: SystemTime,
+    pub created_time: SystemTime,
     pub primary_account: Option<Box<str>>,
 }
 
@@ -267,7 +267,7 @@ pub struct AccountValue<const SALT_LEN: usize, const HASH_LEN: usize, const SESS
     pub password_hash: [u8; HASH_LEN],
     #[serde(with = "serde_hex_array")]
     pub salt: [u8; SALT_LEN],
-    pub last_time: DateTime<Utc>,
+    pub last_time: SystemTime,
     #[serde(with = "serde_hex_array_vec")]
     pub authed_linked_sessions: Vec<[u8; SESSION_LEN]>,
 }
@@ -384,8 +384,8 @@ where
         let session_value = SessionValue::<SESSION_LEN> {
             session_key: session_id,
             linked_accounts_cache: Vec::new(),
-            last_time: Utc::now(),
-            created_time: Utc::now(),
+            last_time: SystemTime::now(),
+            created_time: SystemTime::now(),
             primary_account: None,
         };
         self.sessions.set(&session_id, session_value);
@@ -421,7 +421,7 @@ where
         session_id: &[u8; SESSION_LEN],
     ) -> Option<SessionValue<SESSION_LEN>> {
         if let Some(mut session) = self.gc_sessions(session_id) {
-            session.last_time = Utc::now();
+            session.last_time = SystemTime::now();
             self.sessions.set(session_id, session.clone());
             return Some(session);
         }
@@ -430,8 +430,8 @@ where
 
     pub fn gc_sessions(&self, session_id: &[u8; SESSION_LEN]) -> Option<SessionValue<SESSION_LEN>> {
         if let Some(session) = self.sessions.get(session_id) {
-            let now = Utc::now();
-            if now - session.last_time > self.session_timeout {
+            let now = SystemTime::now();
+            if now.duration_since(session.last_time).unwrap_or(Duration::from_secs(0)) > self.session_timeout {
                 let _ = self.delete_session(session_id);
                 return None;
             }
@@ -461,7 +461,7 @@ where
         let account_value = AccountValue::<SALT_LEN, HASH_LEN, SESSION_LEN> {
             password_hash,
             salt,
-            last_time: Utc::now(),
+            last_time: SystemTime::now(),
             authed_linked_sessions: Vec::new(),
         };
         self.accounts.set(username, account_value);
@@ -513,7 +513,7 @@ where
             // account側が正。ここだけ確実に更新する
             if !account.authed_linked_sessions.contains(session_id) {
                 account.authed_linked_sessions.push(*session_id);
-                account.last_time = Utc::now();
+                account.last_time = SystemTime::now();
                 self.accounts.set(username, account);
             }
 
@@ -552,7 +552,7 @@ where
             account.authed_linked_sessions.retain(|s| s != session_id);
             let changed = account.authed_linked_sessions.len() != before;
             if changed {
-                account.last_time = Utc::now();
+                account.last_time = SystemTime::now();
                 self.accounts.set(username, account);
             }
             return changed;
